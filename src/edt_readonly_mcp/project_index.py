@@ -1,3 +1,3 @@
-from .project_index import ProjectIndex
+from . import ProjectIndex
 
 __all__ = ["ProjectIndex"]
