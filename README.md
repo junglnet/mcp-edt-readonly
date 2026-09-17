@@ -1,84 +1,57 @@
 # edt-readonly-mcp
 
-Read-only MCP server for 1C:EDT projects. It indexes a project on disk and exposes a limited set of tools for metadata, forms, BSL modules, СКД, and tabular document templates without requiring a running EDT instance.
+Read-only stdio MCP server for 1C:EDT projects. It does not start EDT, execute database queries, or modify project files.
 
-This project is intended for AI agents that need structural understanding of a 1C configuration, not for modifying data or changing the project.
-
-## Features
-
-- List metadata objects in a project
-- Read metadata details (attributes, tabular sections, forms, commands)
-- List and read BSL modules
-- Search code across the project
-- Read form structure and command handlers
-- List and inspect DCS (СКД) schemas
-- List and inspect tabular document templates
-- Find document movement patterns from BSL code
-- Operates in read-only mode only
-
-## Quick start
-
-Install:
+## Install and run
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
+# Windows: .venv\\Scripts\\activate
+# Linux/macOS: source .venv/bin/activate
 pip install -e .
+python -m edt_readonly_mcp --project /path/to/edt/project
 ```
 
-Run against a project:
+The server is stdio-based: the MCP client starts it and communicates through stdin/stdout.
 
-```bash
-python -m edt_readonly_mcp.server --project /path/to/your/edt/project
-```
-
-Or with environment variable:
-
-```bash
-export EDT_PROJECT_PATH=/path/to/your/edt/project
-python -m edt_readonly_mcp.server
-```
-
-## Cursor / MCP configuration
-
-Example for Cursor or similar MCP-compatible clients:
+## Cursor
 
 ```json
 {
   "mcpServers": {
     "edt-readonly": {
-      "command": "python",
+      "command": "/absolute/path/to/repo/.venv/bin/python",
       "args": [
         "-m",
-        "edt_readonly_mcp.server",
+        "edt_readonly_mcp",
         "--project",
-        "/path/to/your/edt/project"
+        "/absolute/path/to/edt/project"
       ]
     }
   }
 }
 ```
 
-## Included tools
+On Windows use the Python path inside `.venv\\Scripts\\python.exe` and Windows paths in `--project`.
 
-- `list_metadata_objects`
-- `get_metadata_details`
-- `list_modules`
-- `get_module_structure`
-- `read_method_source`
-- `search_in_code`
-- `get_form_structure`
-- `get_form_command_handler`
-- `list_dcs_schemas`
-- `get_dcs_schema`
-- `list_tabular_document_templates`
-- `get_tabular_document_template`
-- `find_document_movements`
-- `get_project_summary`
+## Build the knowledge index
 
-## Notes
+Run this once, and repeat after source changes:
 
-This is intentionally read-only. It does not modify the project or execute requests against a live database. It is optimized for knowledge extraction and AI context preparation.
+```bash
+python scripts/analyze_project.py --project /path/to/edt/project
+```
 
-The parser intentionally works on the project files directly and is therefore resilient to a missing EDT runtime.
+It creates `.edt-knowledge/domain-index.json` in the project. Generated facts are merged with manually curated `concepts`; the file is not required for the basic reader tools.
+
+The domain tools are:
+
+- `find_data_sources` — resolve a business question to likely metadata sources;
+- `get_object_purpose` — read curated purpose and field mappings;
+- `get_query_patterns` — show generated usage facts from code and queries.
+
+Before calling the separate database-query MCP, the agent should call `find_data_sources`, inspect the selected metadata object, and only then compose a query.
+
+## Current tools
+
+Metadata, BSL, forms, DCS/СКД, tabular document templates, document movements, and domain-source discovery are supported. All operations are read-only.
