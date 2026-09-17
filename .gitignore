@@ -1,0 +1,10 @@
+# .gitignore
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+.vscode/
+.DS_Store
