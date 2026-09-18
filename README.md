@@ -208,6 +208,27 @@ python scripts/analyze_project.py \
 
 Run the analyzer once after checkout and again after source changes. It scans BSL, MDO, and XML files for register references, query sources, and document movements. Existing manually curated `concepts` are preserved when the file is regenerated. The generated index is project-local and should not be treated as live database schema.
 
+For optional AI enrichment, create `.edt-knowledge/ai-agent.json` in the EDT project from the repository example:
+
+```powershell
+New-Item -ItemType Directory -Force "D:\1C\Projects\MyConfiguration\.edt-knowledge"
+Copy-Item ".edt-knowledge\ai-agent.json.example" `
+  "D:\1C\Projects\MyConfiguration\.edt-knowledge\ai-agent.json"
+```
+
+Set an OpenAI-compatible API key and run:
+
+```powershell
+$env:EDT_AI_API_KEY = "..."
+.venv\Scripts\python.exe scripts\analyze_project.py `
+  --project "D:\1C\Projects\MyConfiguration" `
+  --ai
+```
+
+The config contains `model`, `base_url`, `api_key_env`, `temperature` and `timeout_seconds`. It must not contain the API key itself. `EDT_AI_BASE_URL`, `EDT_AI_MODEL` and `OPENAI_API_KEY` can provide environment-level defaults. Use `--config` for another config path; `--model`, `--base-url` and `--temperature` are one-run overrides.
+
+For a local OpenAI-compatible server, set `base_url` to its API root, for example `http://127.0.0.1:1234/v1`. The model receives compact metadata and detected usage facts, not the full project source. AI output is evidence-based enrichment; manually curated concepts remain authoritative.
+
 ## Tool usage
 
 Call `tools/list` first when integrating a new client. For path-based tools, call the corresponding list tool first and pass the returned project-relative path exactly as returned. Paths use `/` separators even on Windows.

@@ -1,0 +1,7 @@
+{
+  "model": "gpt-4o-mini",
+  "base_url": "https://api.openai.com/v1",
+  "api_key_env": "EDT_AI_API_KEY",
+  "temperature": 0,
+  "timeout_seconds": 180
+}

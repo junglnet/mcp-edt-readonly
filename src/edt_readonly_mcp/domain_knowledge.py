@@ -65,5 +65,14 @@ def merge_generated_knowledge(existing: dict[str, Any], generated: dict[str, Any
     result.setdefault("version", 1)
     result["objects"] = generated.get("objects", [])
     result["facts"] = generated.get("facts", [])
-    result.setdefault("concepts", [])
+    manual_concepts = existing.get("concepts", [])
+    manual_ids = {item.get("id") for item in manual_concepts if isinstance(item, dict)}
+    result["concepts"] = list(manual_concepts) + [
+        concept for concept in generated.get("concepts", [])
+        if isinstance(concept, dict) and concept.get("id") not in manual_ids
+    ]
+    if "metadata" in generated:
+        result["metadata"] = generated["metadata"]
+    if generated.get("ai_enriched"):
+        result["ai_enriched"] = True
     return result
