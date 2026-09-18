@@ -68,6 +68,17 @@ class ProjectIndex:
         if not needle:
             return {"error": "Metadata object name is empty"}
         needle_l = needle.lower()
+        type_prefix, _, name_part = needle_l.partition(".")
+        type_aliases = {
+            "документ": "document",
+            "справочник": "catalog",
+            "регистрсведений": "informationregister",
+            "регистрнакопления": "accumulationregister",
+            "отчет": "report",
+            "обработка": "dataprocessor",
+        }
+        requested_type = type_aliases.get(type_prefix, type_prefix) if name_part else ""
+        requested_name = name_part if name_part else needle_l
         candidates = []
         for path in sorted(self.root.rglob("*.mdo")):
             info = self._parse_mdo(path)
@@ -75,9 +86,13 @@ class ProjectIndex:
                 continue
             name_l = info["name"].lower()
             path_l = info["path"].lower()
+            if requested_type and info["type"].lower() != requested_type:
+                continue
+            if requested_name == name_l or path_l.endswith(f"/{requested_name}.mdo"):
+                return info
             if name_l == needle_l or path_l.endswith(f"/{needle_l}.mdo"):
                 return info
-            if needle_l in name_l or needle_l in path_l:
+            if requested_name in name_l or requested_name in path_l:
                 candidates.append(info)
         if candidates:
             return candidates[0]

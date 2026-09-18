@@ -1,4 +1,8 @@
 from pathlib import Path
+import json
+import os
+import subprocess
+import sys
 
 from edt_readonly_mcp import ProjectIndex
 
@@ -35,6 +39,40 @@ def test_get_metadata_details_allows_partial_name_lookup():
     result = index.get_metadata_details(partial)
     assert "error" not in result, result
     assert result["name"].lower().startswith(partial.lower()) or partial.lower() in result["name"].lower(), result
+
+
+def test_get_metadata_details_accepts_russian_type_prefix():
+    index = ProjectIndex(str(PROJECT))
+    result = index.get_metadata_details("Документ.ЗаказПокупателя")
+    assert "error" not in result, result
+    assert result["name"] == "ЗаказПокупателя", result
+    assert result["type"] == "Document", result
+
+
+def test_module_entrypoint_handles_metadata_lookup():
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "get_metadata_details",
+            "arguments": {"object_name": "Документ.ЗаказПокупателя"},
+        },
+    }
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["EDT_PROJECT_PATH"] = str(PROJECT)
+    completed = subprocess.run(
+        [sys.executable, "-m", "edt_readonly_mcp"],
+        input=json.dumps(request, ensure_ascii=False) + "\n",
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=True,
+    )
+    response = json.loads(completed.stdout)
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result["name"] == "ЗаказПокупателя", result
 
 
 def test_search_in_code_finds_text_inside_form_files():
