@@ -64,12 +64,23 @@ class ProjectIndex:
         return objects
 
     def get_metadata_details(self, object_name: str) -> dict[str, Any]:
+        needle = object_name.strip()
+        if not needle:
+            return {"error": "Metadata object name is empty"}
+        needle_l = needle.lower()
+        candidates = []
         for path in sorted(self.root.rglob("*.mdo")):
             info = self._parse_mdo(path)
             if not info:
                 continue
-            if info["name"].lower() == object_name.lower() or info["path"].lower().endswith(f"/{object_name.lower()}.mdo"):
+            name_l = info["name"].lower()
+            path_l = info["path"].lower()
+            if name_l == needle_l or path_l.endswith(f"/{needle_l}.mdo"):
                 return info
+            if needle_l in name_l or needle_l in path_l:
+                candidates.append(info)
+        if candidates:
+            return candidates[0]
         return {"error": f"Metadata object not found: {object_name}"}
 
     def list_modules(self, limit: int = 200) -> list[str]:
@@ -111,10 +122,12 @@ class ProjectIndex:
     def search_in_code(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
         query_l = query.lower()
         matches: list[dict[str, Any]] = []
+        allowed_suffixes = {".bsl", ".xml", ".mdo", ".txt", ".md", ".form", ".dcs", ".dcss", ".mxl", ".mxlx"}
         for path in sorted(self.root.rglob("*")):
             if path.is_dir():
                 continue
-            if path.suffix.lower() not in {".bsl", ".xml", ".mdo", ".txt", ".md"}:
+            name_l = path.name.lower()
+            if path.suffix.lower() not in allowed_suffixes and not any(name_l.endswith(ext) for ext in sorted(allowed_suffixes, key=len, reverse=True)):
                 continue
             try:
                 text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -129,9 +142,15 @@ class ProjectIndex:
 
     def list_forms(self) -> list[str]:
         result: list[str] = []
-        for path in sorted(self.root.rglob("*.xml")):
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
             rel = path.relative_to(self.root).as_posix()
-            if "/Forms/" in rel or rel.endswith(".form.xml") or "/Form/" in rel:
+            lower = rel.lower()
+            if lower.endswith(".form") or lower.endswith(".form.xml"):
+                result.append(rel)
+                continue
+            if lower.endswith(".xml") and ("/forms/" in lower or "/form/" in lower):
                 result.append(rel)
         return result
 
@@ -139,21 +158,31 @@ class ProjectIndex:
         path = self.root / form_path
         if not path.exists():
             return {"error": f"Form not found: {form_path}"}
-        root = ET.parse(path).getroot()
+        try:
+            root = ET.parse(path).getroot()
+        except ET.ParseError as exc:
+            return {"error": f"Could not parse form XML: {form_path} ({exc})"}
+
         items: list[dict[str, Any]] = []
         commands: list[dict[str, Any]] = []
         handlers: list[dict[str, Any]] = []
 
         for elem in root.iter():
             tag = elem.tag.rsplit("}", 1)[-1]
-            if tag in {"Item", "AutoCommandBar", "CommandBar", "FormGroup", "FormField"}:
+            xsi_type = elem.attrib.get(f"{{{self._xsi_namespace(elem)}}}type") if self._xsi_namespace(elem) else None
+            type_name = xsi_type.rsplit(":", 1)[-1] if xsi_type else ""
+            local_names = {tag, type_name}
+
+            if any(name in {"Item", "FormGroup", "FormField", "FormTable", "Decoration", "AutoCommandBar", "CommandBar", "InputField", "TextEdit", "Button", "CheckBoxField", "DateField", "ComboBox", "Label"} for name in local_names if name):
                 name = elem.attrib.get("name") or elem.attrib.get("id") or "unknown"
-                items.append({"name": name, "tag": tag, "attrs": dict(elem.attrib)})
-            if tag == "Command":
+                items.append({"name": name, "tag": tag, "type": type_name or None, "attrs": dict(elem.attrib)})
+
+            if any(name.lower() in {"command", "commands"} for name in local_names if name):
                 cmd_name = elem.attrib.get("name") or elem.attrib.get("id") or "unknown"
-                commands.append({"name": cmd_name, "attrs": dict(elem.attrib)})
-            if tag in {"Handler", "CommandHandler", "OnCreateAtServer", "OnCreateOnServer"}:
-                handlers.append({"tag": tag, "attrs": dict(elem.attrib), "text": (elem.text or '').strip()})
+                commands.append({"name": cmd_name, "tag": tag, "type": type_name or None, "attrs": dict(elem.attrib)})
+
+            if any((name.lower() == "handler" or name.lower().endswith("handler") or name.lower().startswith("oncreate") or name.lower().endswith("oncreate")) for name in local_names if name):
+                handlers.append({"tag": tag, "type": type_name or None, "attrs": dict(elem.attrib), "text": (elem.text or '').strip()})
 
         return {
             "form": form_path,
@@ -166,16 +195,26 @@ class ProjectIndex:
         form = self.get_form_structure(form_path)
         if "error" in form:
             return form
-        for cmd in form.get("commands", []):
+        commands = form.get("commands", [])
+        available = [cmd.get("name") for cmd in commands if isinstance(cmd, dict)]
+        for cmd in commands:
             if cmd["name"].lower() == command_name.lower():
                 return {"form": form_path, "command": cmd, "handlers": form.get("handlers", [])}
-        return {"error": f"Command not found: {command_name} in {form_path}"}
+        return {"error": f"Command not found: {command_name} in {form_path}", "available_commands": available[:20]}
 
     def list_dcs_schemas(self) -> list[str]:
         result: list[str] = []
-        for path in sorted(self.root.rglob("*.xml")):
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
             rel = path.relative_to(self.root).as_posix()
-            if any(token in rel.lower() for token in ["datasource", "dcs", "data composition", "datacomposition", "schemes", "report", "query"]) or rel.lower().endswith(".schema.xml"):
+            lower = rel.lower()
+            if lower.endswith(".dcs") or lower.endswith(".dcss"):
+                result.append(rel)
+                continue
+            if lower.endswith(".xml") and (
+                any(token in lower for token in ["datasource", "dcs", "data composition", "datacomposition", "schemes", "report", "query"]) or lower.endswith(".schema.xml")
+            ):
                 result.append(rel)
         return result
 
@@ -197,11 +236,19 @@ class ProjectIndex:
 
     def list_tabular_document_templates(self) -> list[str]:
         result: list[str] = []
-        for path in sorted(self.root.rglob("*.xml")):
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
             rel = path.relative_to(self.root).as_posix()
-            if "Templates" in rel or "Template" in rel:
-                if "TabularDocument" in rel or "SpreadsheetDocument" in rel or "Template" in rel:
-                    result.append(rel)
+            lower = rel.lower()
+            if not ("templates" in lower or "template" in lower):
+                continue
+            if (
+                lower.endswith((".dcs", ".dcss", ".mxl", ".mxlx", ".bin", ".xml"))
+                or "tabulardocument" in lower
+                or "spreadsheetdocument" in lower
+            ):
+                result.append(rel)
         return result
 
     def get_tabular_document_template(self, template_path: str) -> dict[str, Any]:
@@ -291,6 +338,13 @@ class ProjectIndex:
             if part.endswith("s") or part in {"Catalogs", "Documents", "Reports", "DataProcessors", "CommonModules"}:
                 return part.rstrip("s")
         return path.parent.name
+
+    @staticmethod
+    def _xsi_namespace(elem: ET.Element) -> str | None:
+        for key in elem.attrib:
+            if key.startswith("{http://www.w3.org/2001/XMLSchema-instance}"):
+                return "http://www.w3.org/2001/XMLSchema-instance"
+        return None
 
     def _find_method_end(self, text: str, start: int) -> int:
         # Best effort: find the next procedure/function at the same or lower nesting level.

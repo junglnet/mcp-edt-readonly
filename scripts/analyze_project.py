@@ -17,7 +17,12 @@ MOVEMENT_RE = re.compile(r"(?i)(?:Движения|Movements)\s*[.,]\s*([\wА-Я
 
 def files(root: Path, suffixes: set[str]):
     for path in root.rglob("*"):
-        if path.is_file() and path.suffix.casefold() in suffixes and not (set(path.parts) & EXCLUDED):
+        if not path.is_file():
+            continue
+        if set(path.parts) & EXCLUDED:
+            continue
+        suffix = path.suffix.casefold()
+        if suffix in suffixes or path.name.lower().endswith(tuple(ext.casefold() for ext in suffixes)):
             yield path
 
 
