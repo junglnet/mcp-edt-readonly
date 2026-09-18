@@ -66,6 +66,10 @@ def response(request_id: Any, result: Any = None, error: dict[str, Any] | None =
 def run(project: str) -> None:
     index = ProjectIndex(project)
     knowledge = DomainKnowledge(project)
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     for line in sys.stdin:
         if not line.strip():
             continue

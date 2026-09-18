@@ -66,6 +66,34 @@ def test_module_entrypoint_handles_metadata_lookup():
         [sys.executable, "-m", "edt_readonly_mcp"],
         input=json.dumps(request, ensure_ascii=False) + "\n",
         text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env=environment,
+        check=True,
+    )
+    response = json.loads(completed.stdout)
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result["name"] == "ЗаказПокупателя", result
+
+
+def test_module_entrypoint_preserves_utf8_metadata_name():
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "get_metadata_details",
+            "arguments": {"object_name": "Документ.ЗаказПокупателя"},
+        },
+    }
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["EDT_PROJECT_PATH"] = str(PROJECT)
+    completed = subprocess.run(
+        [sys.executable, "-m", "edt_readonly_mcp"],
+        input=json.dumps(request, ensure_ascii=False) + "\n",
+        text=True,
+        encoding="utf-8",
         capture_output=True,
         env=environment,
         check=True,

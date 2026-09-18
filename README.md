@@ -291,6 +291,8 @@ Pass the project-relative path returned by a list/search operation. Do not pass 
 
 Call `list_metadata_objects` and use the returned `name` or `path`. Typed names such as `Документ.ЗаказПокупателя` and `Справочник.Номенклатура` are supported. Partial names are supported, but an ambiguous partial name returns the first matching object.
 
+If a Cyrillic name is displayed as text like `Р”РѕРєСѓРјРµРЅС‚`, restart the MCP server from the current checkout. The stdio transport expects UTF-8 and the server configures UTF-8 explicitly for stdin and stdout.
+
 ### `Could not parse ... XML`
 
 The file is not valid XML or is not the expected EDT artifact. Use `search_in_code` to inspect it as text and verify the path.
