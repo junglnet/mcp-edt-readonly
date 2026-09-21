@@ -115,7 +115,7 @@ class ProjectIndex:
             return {"error": f"Module not found: {module_path}"}
         text = path.read_text(encoding="utf-8-sig", errors="replace")
         if method_name:
-            pattern = re.compile(rf"(?is)(?:procedure|function)\s+{re.escape(method_name)}\s*\(.*?\)\s*(?:;|\n|$)")
+            pattern = re.compile(rf"(?is)(?:procedure|function|Процедура|Функция)\s+{re.escape(method_name)}\s*\(.*?\)\s*(?:Экспорт|Export)?\s*(?:;|\n|$)")
             match = pattern.search(text)
             if not match:
                 return {"error": f"Method not found: {method_name} in {module_path}", "module": module_path}
@@ -130,7 +130,7 @@ class ProjectIndex:
             return {"error": f"Module not found: {module_path}"}
         text = path.read_text(encoding="utf-8-sig", errors="replace")
         methods: list[dict[str, Any]] = []
-        for match in re.finditer(r"(?is)(?:procedure|function)\s+(\w+)\s*\((.*?)\)", text):
+        for match in re.finditer(r"(?is)(?:procedure|function|Процедура|Функция)\s+(\w+)\s*\((.*?)\)", text):
             methods.append({"name": match.group(1), "signature": match.group(0).strip()})
         return {"module": module_path, "method_count": len(methods), "methods": methods}
 
@@ -363,7 +363,7 @@ class ProjectIndex:
 
     def _find_method_end(self, text: str, start: int) -> int:
         # Best effort: find the next procedure/function at the same or lower nesting level.
-        next_matches = list(re.finditer(r"(?is)\b(?:procedure|function)\b", text[start + 1:]))
+        next_matches = list(re.finditer(r"(?is)\b(?:procedure|function|Процедура|Функция)\b", text[start + 1:]))
         if not next_matches:
             return len(text)
         next_pos = start + 1 + next_matches[0].start()

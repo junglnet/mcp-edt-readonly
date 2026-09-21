@@ -41,17 +41,78 @@ class DomainKnowledge:
         candidates.sort(key=lambda item: (-int(item.get("score", 0)), str(item.get("name", item.get("id", "")))))
         return {"question": question, "sources": candidates[:limit], "generated": True}
 
+    @staticmethod
+    def _name_candidates(name: str) -> list[str]:
+        """Return lookup variants for a metadata object name.
+
+        Handles the 1C syntax ``Документ.ЗаказПокупателя`` (or
+        ``document:ЗаказПокупателя``) by also trying the bare tail part,
+        since entries in the index are stored as ``document:ЗаказПокупателя``
+        / ``ЗаказПокупателя``.
+        """
+        candidates = [name]
+        for sep in (".", ":"):
+            if sep in name:
+                tail = name.rsplit(sep, 1)[-1].strip()
+                if tail and tail not in candidates:
+                    candidates.append(tail)
+        return candidates
+
+    @staticmethod
+    def _richness(item: dict[str, Any]) -> int:
+        """Score how informative an entry is (purpose/description/content)."""
+        score = 0
+        for key in ("purpose", "description", "terms", "fields", "aliases"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                score += 1 + min(len(value.strip()), 100)
+            elif isinstance(value, list) and value:
+                score += 1
+        return score
+
+    @staticmethod
+    def _match_score(candidate: str, item: dict[str, Any]) -> int:
+        """Score how exact a match is: exact id/name wins over substring.
+
+        Returns a tuple-rank via two integers: (exact, rich) — but since callers
+        need a single comparison, we encode exactness as +1_000_000 dominance.
+        """
+        needle = candidate.casefold()
+        item_id = str(item.get("id", "")).casefold()
+        item_name = str(item.get("name", "")).casefold()
+        if needle == item_id or needle == item_name:
+            return 1_000_000
+        aliases = item.get("aliases", [])
+        if isinstance(aliases, list) and any(isinstance(a, str) and a.casefold() == needle for a in aliases):
+            return 1_000_000
+        return 0
+
     def object_purpose(self, name: str) -> dict[str, Any]:
-        needle = name.casefold()
-        for item in self.data.get("concepts", []) + self.data.get("objects", []):
-            haystack = json.dumps(item, ensure_ascii=False).casefold()
-            if needle in haystack:
-                return item
+        best: dict[str, Any] | None = None
+        best_key = (-1, -1)
+        for candidate in self._name_candidates(name):
+            needle = candidate.casefold()
+            for item in self.data.get("concepts", []) + self.data.get("objects", []):
+                if not isinstance(item, dict):
+                    continue
+                haystack = json.dumps(item, ensure_ascii=False).casefold()
+                if needle not in haystack:
+                    continue
+                key = (self._match_score(candidate, item), self._richness(item))
+                if key > best_key:
+                    best = item
+                    best_key = key
+        if best is not None:
+            return best
         return {"error": f"No domain knowledge found for: {name}"}
 
     def query_patterns(self, name: str, limit: int = 20) -> dict[str, Any]:
-        needle = name.casefold()
-        facts = [fact for fact in self.data.get("facts", []) if needle in json.dumps(fact, ensure_ascii=False).casefold()]
+        facts: list[dict[str, Any]] = []
+        for candidate in self._name_candidates(name):
+            needle = candidate.casefold()
+            for fact in self.data.get("facts", []):
+                if needle in json.dumps(fact, ensure_ascii=False).casefold() and fact not in facts:
+                    facts.append(fact)
         return {"object": name, "patterns": facts[:limit]}
 
     @staticmethod
