@@ -1,3 +1,19 @@
+"""Generate read-only domain knowledge from a 1C:EDT project.
+
+Responsibilities are strictly separated:
+
+* Structure (``objects``) is derived **only** from project metadata files
+  (``.mdo``) by a deterministic algorithm. ``id``, ``name``, ``type``,
+  ``qualified_name``, ``path`` and ``fields`` are facts about the
+  configuration and are never invented or modified by the AI model.
+* Code usage (``facts`` and ``usage_count``) is derived only from ``.bsl``
+  modules and is aggregated. Names that do not exist in the metadata
+  structure never become objects (they stay in ``facts`` with
+  ``"unmatched": true``).
+* The AI model (optional ``--ai``) adds only descriptive fields
+  (``purpose``, ``description``, ``aliases``, ``terms``, ``confidence``).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -5,25 +21,104 @@ import http.client
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from edt_readonly_mcp.domain_knowledge import merge_generated_knowledge
+# Allow running the script directly (``python scripts/analyze_project.py``)
+# without installing the package: resolve the project's ``src`` directory
+# relative to this file and make it importable.
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from edt_readonly_mcp.domain_knowledge import merge_generated_knowledge  # noqa: E402
 
 EXCLUDED = {".git", ".edt-knowledge", "target", "bin", "obj", ".venv"}
-REGISTER_RE = re.compile(r"(?:Регистр(?:Сведений|Накопления|Бухгалтерии)\s*\.\s*([\wА-Яа-яЁё]+)|Registers?\s*\.\s*([\w]+))")
-QUERY_RE = re.compile(r"(?is)(?:ИЗ|FROM)\s+(?:Регистр(?:Сведений|Накопления|Бухгалтерии)\s*\.\s*([\wА-Яа-яЁё]+)|([A-Za-z_]\w*))")
+
+REGISTER_RE = re.compile(
+    r"(?:Регистры?(?:Сведений|Накопления|Бухгалтерии|Расчета)?\s*\.\s*([\wА-Яа-яЁё]+)"
+    r"|Registers?\s*\.\s*([\w]+))"
+)
+QUERY_RE = re.compile(
+    r"(?is)(?:\bИЗ\b|\bFROM\b)\s+"
+    r"(?:"
+    r"(?:Регистры?(?:Сведений|Накопления|Бухгалтерии|Расчета)?"
+    r"|Документы?|Справочники?|Перечисления?|Константы?"
+    r"|Планы?(?:ВидовХарактеристик|Счетов|ВидовРасчета|Обмена)?"
+    r"|Задачи?|БизнесПроцессы?)\s*\.\s*([\wА-Яа-яЁё]+)"
+    r"|(?:InformationRegister|AccumulationRegister|AccountingRegister|CalculationRegister"
+    r"|Document|Catalog|Enum|Constant|ExchangePlan|Task|BusinessProcess"
+    r"|ChartOfCharacteristicTypes|ChartOfAccounts|ChartOfCalculationTypes)\s*\.\s*([A-Za-z_]\w*)"
+    r"|([A-Za-z_]\w*)"
+    r")"
+)
 MOVEMENT_RE = re.compile(r"(?i)(?:Движения|Movements)\s*[.,]\s*([\wА-Яа-яЁё]+)")
+
+# EDT metadata category folders: folder name (lowercase) ->
+# (Russian type, id prefix, qualified-name prefix).
+CATEGORIES: dict[str, tuple[str, str, str]] = {
+    "catalogs": ("Справочник", "catalog", "Catalog"),
+    "documents": ("Документ", "document", "Document"),
+    "informationregisters": ("РегистрСведений", "information_register", "InformationRegister"),
+    "accumulationregisters": ("РегистрНакопления", "accumulation_register", "AccumulationRegister"),
+    "accountingregisters": ("РегистрБухгалтерии", "accounting_register", "AccountingRegister"),
+    "calculationregisters": ("РегистрРасчета", "calculation_register", "CalculationRegister"),
+    "enums": ("Перечисление", "enum", "Enum"),
+    "constants": ("Константа", "constant", "Constant"),
+    "reports": ("Отчет", "report", "Report"),
+    "dataprocessors": ("Обработка", "data_processor", "DataProcessor"),
+    "exchangeplans": ("ПланОбмена", "exchange_plan", "ExchangePlan"),
+    "tasks": ("Задача", "task", "Task"),
+    "businessprocesses": ("БизнесПроцесс", "business_process", "BusinessProcess"),
+    "sequences": ("Последовательность", "sequence", "Sequence"),
+    "commonmodules": ("ОбщийМодуль", "common_module", "CommonModule"),
+    "chartsofcharacteristictypes": ("ПланВидовХарактеристик", "characteristic_plan", "ChartOfCharacteristicTypes"),
+    "chartsofaccounts": ("ПланСчетов", "chart_of_accounts", "ChartOfAccounts"),
+    "chartsofcalculationtypes": ("ПланВидовРасчета", "calculation_type_plan", "ChartOfCalculationTypes"),
+}
+
+# Fallback when the folder layout is non-standard: EDT .mdo root tag ->
+# category folder name.
+TAG_TO_CATEGORY: dict[str, str] = {
+    "Catalog": "catalogs",
+    "Document": "documents",
+    "InformationRegister": "informationregisters",
+    "AccumulationRegister": "accumulationregisters",
+    "AccountingRegister": "accountingregisters",
+    "CalculationRegister": "calculationregisters",
+    "Enum": "enums",
+    "Constant": "constants",
+    "Report": "reports",
+    "DataProcessor": "dataprocessors",
+    "ExchangePlan": "exchangeplans",
+    "Task": "tasks",
+    "BusinessProcess": "businessprocesses",
+    "Sequence": "sequences",
+    "CommonModule": "commonmodules",
+    "ChartOfCharacteristicTypes": "chartsofcharacteristictypes",
+    "ChartOfAccounts": "chartsofaccounts",
+    "ChartOfCalculationTypes": "chartsofcalculationtypes",
+}
+
+# Fields the AI model is allowed to set on an object.
+DESCRIPTIVE_FIELDS = frozenset({"purpose", "description", "aliases", "terms", "confidence"})
+# Fields the AI model must never touch: they describe the real configuration.
+STRUCTURAL_FIELDS = frozenset({"id", "name", "type", "qualified_name", "path", "usage_count", "fields", "synonym"})
+
 DEFAULT_SYSTEM_PROMPT = (
-    "Ты анализируешь экспортированный проект 1С:EDT. Верни только JSON-объект с ключами "
-    "objects и concepts. Описывай только то, что подтверждается данными; не придумывай "
-    "бизнес-правила. Для object используй id существующего объекта, name, purpose, "
-    "description, aliases, terms, fields и confidence. Добавляй concepts только для явно "
-    "видимых бизнес-сущностей. Не включай исходный код и длинные цитаты."
+    "Ты анализируешь экспортированный проект 1С:EDT. Тебе передан каталог объектов метаданных "
+    "(id, name, type). Эта структура получена алгоритмом из файлов метаданных проекта и является "
+    "истиной: запрещено создавать новые объекты, запрещено менять id, name и type. Верни только "
+    "JSON-объект с ключами objects и concepts, где для каждого объекта заполнены только "
+    "описательные поля: purpose, description, aliases, terms, confidence. В concepts ссылайся "
+    "только на существующие id объектов. Описывай только то, что подтверждается данными; "
+    "не придумывай бизнес-правила. Не включай исходный код и длинные цитаты."
 )
 
 
@@ -47,57 +142,282 @@ def files(root: Path, suffixes: set[str]):
 
 
 def analyze(root: Path) -> dict[str, Any]:
-    register_usage: Counter[str] = Counter()
-    facts: list[dict[str, Any]] = []
-    objects: list[dict[str, Any]] = []
-    for path in files(root, {".bsl", ".mdo", ".xml"}):
-        try:
-            text = path.read_text(encoding="utf-8-sig", errors="replace")
-        except OSError:
-            continue
-        rel = path.relative_to(root).as_posix()
-        for match in REGISTER_RE.finditer(text):
-            name = match.group(1) or match.group(2)
-            register_usage[name] += 1
-            facts.append({"kind": "register_reference", "object": name, "path": rel, "preview": _preview(text, match.start())})
-        for match in QUERY_RE.finditer(text):
-            name = match.group(1) or match.group(2)
-            if name:
-                facts.append({"kind": "query_source", "object": name, "path": rel, "preview": _preview(text, match.start())})
-        for match in MOVEMENT_RE.finditer(text):
-            facts.append({"kind": "document_movement", "register": match.group(1), "path": rel, "preview": _preview(text, match.start())})
-    for name, count in register_usage.most_common():
-        objects.append({
-            "id": f"register:{name}",
-            "name": name,
-            "type": "data_source_candidate",
-            "purpose": "Register referenced by project code; inspect facts and schema before querying.",
-            "usage_count": count,
-            "aliases": [name],
-        })
-    return {"version": 1, "generated_by": "analyze_project", "objects": objects, "facts": facts, "metadata": _metadata_snapshot(root)}
+    """Build the v2 index: structure objects + aggregated code facts."""
+    objects = _scan_structure(root)
+
+    token_to_ids: dict[str, list[str]] = {}
+    for obj in objects:
+        token_to_ids.setdefault(obj["name"], []).append(obj["id"])
+        synonym = obj.get("synonym")
+        if synonym:
+            token_to_ids.setdefault(synonym, []).append(obj["id"])
+    usage = _count_name_usage(root, token_to_ids)
+    for obj in objects:
+        obj["usage_count"] = usage.get(obj["id"], 0)
+
+    facts = _scan_code_facts(root, objects)
+    return {
+        "version": 2,
+        "generated_by": "analyze_project",
+        "objects": objects,
+        "facts": facts,
+    }
 
 
-def _metadata_snapshot(root: Path, limit: int = 500) -> list[dict[str, Any]]:
-    """Collect compact EDT metadata context without sending source files wholesale."""
-    snapshot: list[dict[str, Any]] = []
+def _scan_structure(root: Path) -> list[dict[str, Any]]:
+    """Scan .mdo files and build the strict metadata object list."""
+    objects: dict[str, dict[str, Any]] = {}
     for path in sorted(root.rglob("*.mdo")):
         if any(part in EXCLUDED for part in path.parts):
             continue
+        category = _detect_category(path)
+        if category is None:
+            continue
+        mdo_type, prefix, qualified_prefix = CATEGORIES[category]
+        name = path.stem
+        obj_id = f"{prefix}:{name}"
+        if obj_id in objects:
+            continue
+        fields, synonym = _parse_mdo_details(path)
+        obj: dict[str, Any] = {
+            "id": obj_id,
+            "name": name,
+            "type": mdo_type,
+            "qualified_name": f"{qualified_prefix}.{name}",
+            "path": path.relative_to(root).as_posix(),
+            "usage_count": 0,
+            "fields": fields,
+        }
+        if synonym and synonym != name:
+            obj["synonym"] = synonym
+        objects[obj_id] = obj
+    return sorted(objects.values(), key=lambda item: (item["type"], item["name"]))
+
+
+def _detect_category(path: Path) -> str | None:
+    """Determine the metadata category for a .mdo file.
+
+    Primary source is the project folder layout (``Catalogs/X/X.mdo``);
+    fallback is the .mdo root XML tag. Files whose category cannot be
+    determined are skipped — nothing is ever guessed from a name.
+    """
+    for parent in (path.parent.name, path.parent.parent.name):
+        folder = parent.casefold()
+        if folder in CATEGORIES:
+            return folder
+    try:
+        root_tag = ET.parse(path).getroot().tag.rsplit("}", 1)[-1]
+    except (ET.ParseError, OSError):
+        return None
+    local_tag = root_tag
+    if local_tag.startswith("MetaObject"):
+        local_tag = local_tag.rsplit("-", 1)[-1]
+    local_tag = local_tag.rsplit(":", 1)[-1]
+    return TAG_TO_CATEGORY.get(local_tag)
+
+
+# Direct children of an EDT (mdclass) .mdo root that declare object fields.
+EDT_FIELD_SECTIONS = frozenset({
+    "attributes",
+    "dimensions",
+    "resources",
+    "tabularSections",
+    "addressingAttributes",
+    "commonAttributes",
+    "accountingFlags",
+    "extDimensionAccountingFlags",
+})
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _parse_mdo_details(mdo_path: Path) -> tuple[dict[str, str], str | None]:
+    """Extract structural fields and the Russian synonym from a .mdo file.
+
+    Supports both EDT ``mdclass:`` files (flat layout: direct ``<attributes>``
+    children with ``<name>`` / ``<type><types>...`` and ``key``/``value``
+    synonyms) and configurator ``MetaObject-*`` files (``Properties`` /
+    ``ChildObjects`` layout).
+    """
+    try:
+        root = ET.parse(mdo_path).getroot()
+    except (ET.ParseError, OSError):
+        return {}, None
+    if _local(root.tag).casefold().startswith("metaobject"):
+        return _parse_mdo_details_configurator(root)
+    return _parse_mdo_details_edt(root)
+
+
+def _parse_mdo_details_edt(root: ET.Element) -> tuple[dict[str, str], str | None]:
+    fields: dict[str, str] = {}
+    synonym: str | None = None
+    for section in root:
+        tag = _local(section.tag)
+        if tag == "synonym" and synonym is None:
+            synonym = _edt_synonym(section)
+        elif tag in EDT_FIELD_SECTIONS:
+            name = None
+            vtype = ""
+            for prop in section:
+                prop_tag = _local(prop.tag)
+                if prop_tag == "name" and prop.text:
+                    name = prop.text.strip()
+                elif prop_tag == "type":
+                    vtype = _edt_type(prop)
+            if name and name not in fields:
+                fields[name] = vtype or "Произвольный"
+                if len(fields) >= 100:
+                    break
+    return fields, synonym
+
+
+def _edt_synonym(synonym_elem: ET.Element) -> str | None:
+    """Parse ``<synonym><key>ru</key><value>...</value></synonym>``."""
+    key = value = None
+    for item in synonym_elem:
+        tag = _local(item.tag)
+        if tag == "key":
+            key = (item.text or "").strip()
+        elif tag == "value":
+            value = (item.text or "").strip()
+    return value or None
+
+
+def _edt_type(type_elem: ET.Element) -> str:
+    for node in type_elem.iter():
+        if _local(node.tag) == "types" and node.text and node.text.strip():
+            return node.text.strip()
+    return ""
+
+
+def _parse_mdo_details_configurator(root: ET.Element) -> tuple[dict[str, str], str | None]:
+    field_tags = {"Attribute", "Dimension", "Resource", "TabularSection", "CommonAttribute", "AddressingAttribute"}
+    fields: dict[str, str] = {}
+    synonym: str | None = None
+    synonym_checked = False
+    for elem in root.iter():
+        tag = _local(elem.tag)
+        if tag == "Synonym" and not synonym_checked:
+            synonym_checked = True
+            synonym = _configurator_synonym(elem)
+        elif tag in field_tags:
+            name, vtype = "", ""
+            for child in elem:
+                if _local(child.tag) != "Properties":
+                    continue
+                for prop in child:
+                    prop_tag = _local(prop.tag)
+                    if prop_tag == "Name" and prop.text:
+                        name = prop.text.strip()
+                    elif prop_tag == "Type" and not vtype:
+                        vtype = _first_type_text(prop)
+            if name:
+                fields[name] = vtype or "Произвольный"
+                if len(fields) >= 100:
+                    break
+    return fields, synonym
+
+
+def _first_type_text(container: ET.Element) -> str:
+    for node in container.iter():
+        tag = _local(node.tag)
+        if tag in {"Type", "TypeSet"} and node.text and node.text.strip():
+            return node.text.strip()
+    return ""
+
+
+def _configurator_synonym(synonym_elem: ET.Element) -> str | None:
+    first: str | None = None
+    russian: str | None = None
+    for item in synonym_elem:
+        if _local(item.tag) != "item":
+            continue
+        lang, content = None, None
+        for node in item:
+            node_tag = _local(node.tag)
+            if node_tag == "lang":
+                lang = (node.text or "").strip()
+            elif node_tag == "content":
+                content = (node.text or "").strip()
+        if content and first is None:
+            first = content
+        if lang == "ru" and content:
+            russian = content
+            break
+    return russian or first
+
+
+def _count_name_usage(root: Path, token_to_ids: dict[str, list[str]]) -> Counter[str]:
+    """Count whole-identifier occurrences of object names in .bsl modules."""
+    usage: Counter[str] = Counter()
+    for path in files(root, {".bsl"}):
         try:
             text = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
-        names = re.findall(r"(?:name|Name|title|Title|synonym|Synonym)\s*[=:]\s*[\"']([^\"']+)", text)
-        snapshot.append({
-            "name": path.stem,
-            "type": path.parent.name,
-            "path": path.relative_to(root).as_posix(),
-            "declared_names": list(dict.fromkeys(names))[:20],
-        })
-        if len(snapshot) >= limit:
-            break
-    return snapshot
+        for token in re.findall(r"[\wА-Яа-яЁё]+", text):
+            ids = token_to_ids.get(token)
+            if ids:
+                for obj_id in ids:
+                    usage[obj_id] += 1
+    return usage
+
+
+def _scan_code_facts(root: Path, objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect aggregated usage facts from .bsl modules only.
+
+    Each fact is aggregated by (kind, object) with a usage count, up to ten
+    example paths and one short preview. Facts referencing names absent from
+    the metadata structure are kept for evidence but flagged ``unmatched``;
+    they never create objects.
+    """
+    structure_names = {obj["name"] for obj in objects}
+    aggregated: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add(kind: str, name: str | None, path: Path, text: str, position: int) -> None:
+        if not name:
+            return
+        entry = aggregated.setdefault((kind, name), {"count": 0, "paths": set(), "preview": ""})
+        entry["count"] += 1
+        entry["paths"].add(path.relative_to(root).as_posix())
+        if not entry["preview"]:
+            entry["preview"] = _preview(text, position)[:200]
+
+    for path in files(root, {".bsl"}):
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        for match in REGISTER_RE.finditer(text):
+            add("register_reference", match.group(1) or match.group(2), path, text, match.start())
+        for match in QUERY_RE.finditer(text):
+            name = match.group(1) or match.group(2) or match.group(3)
+            if name:
+                add("query_source", name, path, text, match.start())
+        for match in MOVEMENT_RE.finditer(text):
+            add("document_movement", match.group(1), path, text, match.start())
+
+    facts: list[dict[str, Any]] = []
+    for (kind, name), data in sorted(aggregated.items(), key=lambda item: (item[0][1], item[0][0])):
+        fact: dict[str, Any] = {
+            "kind": kind,
+            "object": name,
+            "count": data["count"],
+            "paths": sorted(data["paths"])[:10],
+            "preview": data["preview"],
+        }
+        if name not in structure_names:
+            fact["unmatched"] = True
+        facts.append(fact)
+    return facts
+
+
+def _preview(text: str, position: int) -> str:
+    line_start = text.rfind("\n", 0, position) + 1
+    line_end = text.find("\n", position)
+    return text[line_start: line_end if line_end >= 0 else len(text)].strip()[:500]
 
 
 def _call_chat(
@@ -236,90 +556,28 @@ def _is_transient(message: str) -> bool:
 
 
 def _object_catalog(analysis: dict[str, Any], limit: int = 300) -> list[dict[str, Any]]:
-    """Build a compact, deduplicated catalog of objects {id, name, type} for the AI.
+    """Build the compact catalog of real metadata objects for the AI.
 
-    Only names that look like real business objects (directories, documents,
-    registers — Cyrillic identifiers and/or PascalCase) are sent to the model.
-    The raw fact stream stays entirely local and is never sent to the AI.
+    Entries come strictly from the project structure: ``objects`` already
+    carry exact ``id`` and ``type`` derived from .mdo files, so the model can
+    never invent or reclassify anything. The raw fact stream stays local and
+    is never sent to the AI.
 
     Entries are sorted by popularity (usage_count descending) and capped at
-    ``limit`` so the model reliably returns descriptions for all of them in a
-    single response (otherwise the largest projects hit output limits and many
-    objects are left without an AI description).
+    ``limit`` so the model reliably returns descriptions for all of them.
     """
-    seen: dict[str, str] = {}
-    usage: dict[str, int] = {}
-    kind_names = {
-        "document_movement": "Документ",
-        "query_source": None,
-        "register_reference": "Регистр",
-    }
-    for fact in analysis.get("facts", []):
-        if not isinstance(fact, dict):
-            continue
-        kind = fact.get("kind")
-        name = fact.get("object") or (fact.get("register") if kind == "document_movement" else None)
-        if not isinstance(name, str) or not name:
-            continue
-        obj_type = kind_names.get(kind)
-        if obj_type is None:
-            # for query_source we can't reliably tell the type from an identifier alone
-            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) and not re.fullmatch(r"[А-ЯЁ][\wА-Яа-яЁё]*", name):
-                continue
-            obj_type = _classify_name(name)
-        if name not in seen:
-            seen[name] = obj_type
-        usage[name] = usage.get(name, 0) + 1
-    for obj in analysis.get("objects", []):
-        if not isinstance(obj, dict):
-            continue
-        name = obj.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        seen[name] = str(obj.get("type") or _classify_name(name))
-        usage[name] = max(usage.get(name, 0), int(obj.get("usage_count") or 0))
-
-    object_ids = {obj.get("name"): obj.get("id") for obj in analysis.get("objects", []) if isinstance(obj, dict) and obj.get("id")}
-    usage_counts = {obj.get("name"): int(obj.get("usage_count") or 0) for obj in analysis.get("objects", []) if isinstance(obj, dict)}
-    entries = []
-    for name, obj_type in seen.items():
-        obj_id = object_ids.get(name)
-        if not obj_id:
-            obj_id = _default_object_id(name, obj_type)
-        entries.append({
-            "id": obj_id,
-            "name": name,
-            "type": obj_type,
-            "usage_count": max(usage.get(name, 0), usage_counts.get(name, 0)),
-        })
+    entries = [
+        {
+            "id": obj.get("id"),
+            "name": obj.get("name"),
+            "type": obj.get("type"),
+            "usage_count": int(obj.get("usage_count") or 0),
+        }
+        for obj in analysis.get("objects", [])
+        if isinstance(obj, dict) and obj.get("id")
+    ]
     entries.sort(key=lambda item: (-int(item.get("usage_count") or 0), str(item.get("name", ""))))
     return entries[:limit] if limit else entries
-
-
-def _default_object_id(name: str, obj_type: str) -> str:
-    """Generate a stable id like ``register:Name`` when no id exists yet."""
-    lowered = obj_type.casefold()
-    if any(key in lowered for key in ("регистр", "register")):
-        prefix = "register"
-    elif any(key in lowered for key in ("документ", "document")):
-        prefix = "document"
-    elif any(key in lowered for key in ("справочник", "справочн", "каталог", "directory", "catalog")):
-        prefix = "catalog"
-    else:
-        prefix = "object"
-    return f"{prefix}:{name}"
-
-
-def _classify_name(name: str) -> str:
-    """Best-effort type label based on the identifier shape."""
-    lowered = name.casefold()
-    if any(key in lowered for key in ("справочник", "справочн", "каталог", "directory", "catalog")):
-        return "Справочник"
-    if any(key in lowered for key in ("документ", "document")):
-        return "Документ"
-    if any(key in lowered for key in ("регистр", "register")):
-        return "Регистр"
-    return "Объект"
 
 
 def enrich_with_ai(
@@ -337,14 +595,16 @@ def enrich_with_ai(
 ) -> dict[str, Any]:
     """Ask an OpenAI-compatible model to describe only the business objects.
 
-    The AI receives a compact catalog of object names (directories, documents,
-    registers) — not the raw fact stream — and returns purposes/descriptions
-    for them. The catalog is sent in small batches (``catalog_batch_size``)
-    because a single request can only return a limited number of descriptions;
-    batching ensures every sent object gets one. If the model hits its output
-    limit and truncates a response (finish_reason='length'), the chunk is
-    automatically split in half and re-sent, so no object is lost. Facts
-    remain local and are merged back unchanged.
+    The AI receives a compact catalog of real metadata objects (id, name,
+    type taken from the project structure) — not the raw fact stream — and
+    returns descriptive fields for them. The catalog is sent in small batches
+    (``catalog_batch_size``) because a single request can only return a
+    limited number of descriptions; batching ensures every sent object gets
+    one. If the model hits its output limit and truncates a response
+    (finish_reason='length'), the chunk is automatically split in half and
+    re-sent, so no object is lost. Facts remain local and are merged back
+    unchanged. Structural fields (id/name/type/path) cannot be changed by the
+    model, and model-provided objects absent from the structure are ignored.
     """
     catalog = _object_catalog(analysis, limit=catalog_limit)
     if not catalog:
@@ -387,9 +647,61 @@ def enrich_with_ai(
             continue
         full_enrichment["objects"].extend(enrichment.get("objects", []))
         full_enrichment["concepts"].extend(enrichment.get("concepts", []))
-    enriched = _apply_enrichment(analysis, full_enrichment, catalog)
+    enriched = _apply_enrichment(analysis, full_enrichment)
     enriched["concepts"] = [item for item in enriched.get("concepts", []) if isinstance(item, dict)]
     return enriched
+
+
+def _apply_enrichment(
+    analysis: dict[str, Any],
+    enrichment: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge AI descriptions into structure objects without touching structure.
+
+    * Model items whose id and name do not match a real structure object are
+      ignored — the model cannot create objects.
+    * Only descriptive fields are applied; id, name, type, qualified_name,
+      path, usage_count, synonym are protected, and model ``fields`` are
+      accepted only when the .mdo file declares none.
+    * Concept object references are validated against the structure.
+    """
+    result = dict(analysis)
+    objects = {obj["id"]: dict(obj) for obj in result.get("objects", []) if isinstance(obj, dict) and obj.get("id")}
+    by_name = {obj["name"]: obj for obj in objects.values() if obj.get("name")}
+    known_ids = set(objects)
+
+    for item in enrichment.get("objects", []):
+        if not isinstance(item, dict):
+            continue
+        target = objects.get(item.get("id"))
+        if target is None and item.get("name"):
+            target = by_name.get(item["name"])
+        if target is None:
+            continue
+        for key, value in item.items():
+            if key in STRUCTURAL_FIELDS or key not in DESCRIPTIVE_FIELDS:
+                continue
+            if value not in (None, "", [], {}):
+                target[key] = value
+        if not target.get("fields"):
+            model_fields = item.get("fields")
+            if isinstance(model_fields, dict) and model_fields:
+                target["fields"] = model_fields
+
+    concepts = []
+    for concept in enrichment.get("concepts", []):
+        if not isinstance(concept, dict):
+            continue
+        refs = concept.get("objects")
+        if isinstance(refs, list):
+            concept = dict(concept)
+            concept["objects"] = [ref for ref in refs if isinstance(ref, str) and ref in known_ids]
+        concepts.append(concept)
+
+    result["objects"] = list(objects.values())
+    result["concepts"] = concepts
+    result["ai_enriched"] = True
+    return result
 
 
 def _load_ai_config(path: Path) -> dict[str, Any]:
@@ -400,56 +712,6 @@ def _load_ai_config(path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise RuntimeError(f"AI config must contain a JSON object: {path}")
     return config
-
-
-def _apply_enrichment(
-    analysis: dict[str, Any],
-    enrichment: dict[str, Any],
-    catalog: list[dict[str, str]] | None = None,
-) -> dict[str, Any]:
-    result = dict(analysis)
-    generated_objects = {item.get("id"): item for item in result.get("objects", []) if item.get("id")}
-    by_name = {item.get("name"): item for item in result.get("objects", []) if item.get("name")}
-    # Ensure every catalog entry is present so that name-only matches can land even
-    # for objects that only ever appeared in facts (not in analysis["objects"]).
-    for entry in catalog or []:
-        if not isinstance(entry, dict):
-            continue
-        obj_id = entry.get("id")
-        name = entry.get("name")
-        if obj_id and obj_id not in generated_objects:
-            new_obj = {
-                "id": obj_id,
-                "name": name,
-                "type": entry.get("type") or "data_source_candidate",
-                "purpose": "Register referenced by project code; inspect facts and schema before querying.",
-                "aliases": [name] if name else [],
-            }
-            generated_objects[obj_id] = new_obj
-            if name:
-                by_name[name] = new_obj
-    for item in enrichment.get("objects", []):
-        if not isinstance(item, dict):
-            continue
-        target = generated_objects.get(item.get("id"))
-        if target is None and item.get("name"):
-            target = by_name.get(item["name"])
-        if target is None:
-            continue
-        target.update({
-            key: value for key, value in item.items()
-            if key not in ("id",) and value not in (None, "", [], {})
-        })
-    result["objects"] = list(generated_objects.values())
-    result["concepts"] = [item for item in enrichment.get("concepts", []) if isinstance(item, dict)]
-    result["ai_enriched"] = True
-    return result
-
-
-def _preview(text: str, position: int) -> str:
-    line_start = text.rfind("\n", 0, position) + 1
-    line_end = text.find("\n", position)
-    return text[line_start: line_end if line_end >= 0 else len(text)].strip()[:500]
 
 
 def _find_ai_config(start: Path) -> Path | None:

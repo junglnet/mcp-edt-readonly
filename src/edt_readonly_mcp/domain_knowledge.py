@@ -121,19 +121,56 @@ class DomainKnowledge:
 
 
 def merge_generated_knowledge(existing: dict[str, Any], generated: dict[str, Any]) -> dict[str, Any]:
-    """Merge analyzer output while preserving manually curated concepts."""
+    """Merge analyzer output while preserving manually curated concepts.
+
+    ``objects`` and ``facts`` always come from the generator: they describe
+    the real project structure and code usage and must never be altered by
+    the AI. The v1 ``metadata`` section is dropped (it duplicated ``objects``
+    in degraded form and is read by no tool).
+
+    Concept ``objects`` references are re-mapped onto the current structure:
+    legacy ids (``register:X``, ``object:X``) are replaced by the real id of
+    the structure object with the same name, and references without any
+    matching structure object are dropped.
+    """
     result = dict(existing)
-    result.setdefault("version", 1)
+    result["version"] = int(generated.get("version", 2))
     result["objects"] = generated.get("objects", [])
     result["facts"] = generated.get("facts", [])
+
+    by_id = {obj["id"]: obj for obj in result["objects"] if isinstance(obj, dict) and obj.get("id")}
+    by_name: dict[str, list[str]] = {}
+    for obj in by_id.values():
+        by_name.setdefault(str(obj.get("name", "")), []).append(obj["id"])
+
+    def _remap_refs(concept: dict[str, Any]) -> dict[str, Any]:
+        refs = concept.get("objects")
+        if not isinstance(refs, list):
+            return concept
+        mapped: list[str] = []
+        for ref in refs:
+            if not isinstance(ref, str) or not ref:
+                continue
+            if ref in by_id:
+                mapped.append(ref)
+                continue
+            tail = ref.rsplit(":", 1)[-1].strip()
+            candidates = by_name.get(tail, [])
+            if len(candidates) == 1:
+                mapped.append(candidates[0])
+        concept = dict(concept)
+        concept["objects"] = mapped
+        return concept
+
     manual_concepts = existing.get("concepts", [])
     manual_ids = {item.get("id") for item in manual_concepts if isinstance(item, dict)}
-    result["concepts"] = list(manual_concepts) + [
-        concept for concept in generated.get("concepts", [])
+    result["concepts"] = [_remap_refs(item) for item in manual_concepts if isinstance(item, dict)] + [
+        _remap_refs(concept) for concept in generated.get("concepts", [])
         if isinstance(concept, dict) and concept.get("id") not in manual_ids
     ]
-    if "metadata" in generated:
-        result["metadata"] = generated["metadata"]
+    result.pop("metadata", None)
     if generated.get("ai_enriched"):
         result["ai_enriched"] = True
+    else:
+        result.pop("ai_enriched", None)
     return result

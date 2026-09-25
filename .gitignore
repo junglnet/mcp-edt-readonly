@@ -17,3 +17,6 @@ coverage.xml
 # Environment / secrets
 .env
 .edt-knowledge/ai-agent.json
+
+# Generated domain index (large, derived from a real project)
+tests/domain-index.json
